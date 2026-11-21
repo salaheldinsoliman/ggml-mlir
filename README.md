@@ -31,7 +31,9 @@ llama.cpp graph
 | A real model (SmolLM2-135M, f16) with every `MUL_MAT` compiled through MLIR | output matches the CPU backend (see below) |
 | Quantised weights (Q8_0, Q4_0, Q4_K) | not yet |
 | Other operations (norm, softmax, RoPE, ...) | not yet |
-| AMD NPU compile path | not yet |
+| AMD NPU compilers installed in an x86 container (`scripts/amd-toolchain.sh`); AMD's own bf16 matmul example compiles there without hardware | yes |
+| AMD's compiler front end (`air-opt`) reads the MLIR the plugin emits, unchanged | yes |
+| The plugin's MLIR compiled all the way to an NPU binary | not yet |
 | Run on NPU hardware | not yet |
 
 The generated CPU code is plain loops and is slow. Speed on the CPU is not a goal.

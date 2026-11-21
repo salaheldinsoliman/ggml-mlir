@@ -12,6 +12,7 @@
 #include "ggml-mlir-impl.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <sstream>
@@ -22,6 +23,7 @@ static const char * mlir_elem_type(enum ggml_type type) {
         case GGML_TYPE_F32:  return "f32";
         case GGML_TYPE_F16:  return "f16";
         case GGML_TYPE_BF16: return "bf16";
+        case GGML_TYPE_I32:  return "i32";
         default:             return nullptr;
     }
 }
@@ -99,6 +101,14 @@ static bool is_f32(const struct ggml_tensor * t) {
     return t->type == GGML_TYPE_F32 && is_readable(t);
 }
 
+static bool is_float(const struct ggml_tensor * t) {
+    return (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16) && is_readable(t);
+}
+
+static bool is_i32(const struct ggml_tensor * t) {
+    return t->type == GGML_TYPE_I32 && is_readable(t);
+}
+
 static bool same_shape(const struct ggml_tensor * a, const struct ggml_tensor * b) {
     return a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1] && a->ne[2] == b->ne[2] && a->ne[3] == b->ne[3];
 }
@@ -136,7 +146,7 @@ bool ggml_mlir_can_emit(const struct ggml_tensor * node) {
     switch (node->op) {
         case GGML_OP_MUL_MAT:
             // weights may be half precision, activations and result are f32
-            return is_readable(src0) && is_f32(src1) && node->type == GGML_TYPE_F32 &&
+            return is_float(src0) && is_f32(src1) && node->type == GGML_TYPE_F32 &&
                    src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0;
 
         case GGML_OP_ADD:
@@ -159,8 +169,32 @@ bool ggml_mlir_can_emit(const struct ggml_tensor * node) {
             return is_f32(src0) && node->type == GGML_TYPE_F32;
 
         case GGML_OP_SOFT_MAX:
-            // plain softmax only: no mask, no sinks, no ALiBi bias
-            return is_f32(src0) && node->type == GGML_TYPE_F32 && src1 == nullptr && node->src[2] == nullptr && op_param_f32(node, 1) == 0.0f;
+            // optional additive mask (src1), broadcast over heads and streams. No sinks, no ALiBi bias.
+            if (!is_f32(src0) || node->type != GGML_TYPE_F32 || node->src[2] != nullptr || op_param_f32(node, 1) != 0.0f) {
+                return false;
+            }
+            return src1 == nullptr ||
+                   ((src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && is_readable(src1) &&
+                    src1->ne[0] == src0->ne[0] && src1->ne[1] >= src0->ne[1] &&
+                    (src1->ne[2] == 1 || src1->ne[2] == src0->ne[2]) &&
+                    (src1->ne[3] == 1 || src1->ne[3] == src0->ne[3]));
+
+        case GGML_OP_ROPE: {
+            // standard and NeoX layouts, one position per token. No YaRN, no frequency factors, no offset.
+            const int32_t n_dims = op_param_i32(node, 1);
+            const int32_t mode   = op_param_i32(node, 2);
+            return is_f32(src0) && node->type == GGML_TYPE_F32 && is_i32(src1) && node->src[2] == nullptr &&
+                   src1->ne[0] == src0->ne[2] && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                   (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX) &&
+                   n_dims > 0 && n_dims % 2 == 0 && n_dims <= src0->ne[0] &&
+                   op_param_f32(node, 7) == 0.0f && op_param_i32(node, 15) == 0;
+        }
+
+        case GGML_OP_GET_ROWS:
+            // rows of a 2-D float table picked by a vector of indices
+            return is_float(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                   is_i32(src1) && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                   node->type == GGML_TYPE_F32;
 
         case GGML_OP_UNARY:
             return unary_supported(node) && node->type == GGML_TYPE_F32;
@@ -170,7 +204,7 @@ bool ggml_mlir_can_emit(const struct ggml_tensor * node) {
             return op_param_i32(node, 0) == GGML_GLU_OP_SWIGLU && src1 != nullptr && is_f32(src0) && is_f32(src1) && node->type == GGML_TYPE_F32;
 
         case GGML_OP_CONT:
-            return is_readable(src0) && src0->type == node->type;
+            return is_readable(src0) && src0->type == node->type && ggml_nelements(src0) == ggml_nelements(node);
 
         default:
             return false;
@@ -364,6 +398,50 @@ static std::string emit_mul_mat(builder & b, const struct ggml_tensor * node) {
     return y4;
 }
 
+// An operand that is broadcast along some dims of a 4-D iteration space.
+struct operand {
+    std::string val;
+    std::string ty;
+    std::string map;
+};
+
+// `val` has dims `d` and is used in a generic over dims `full`. Dims where it has size 1 but the
+// space is larger are dropped, so its indexing map stays a plain projection.
+static operand broadcast4(builder & b, const std::string & val, const std::vector<int64_t> & d, const std::vector<int64_t> & full, const char * elem) {
+    std::vector<int> kept;
+    for (int i = 0; i < 4; i++) {
+        if (d[i] == full[i]) {
+            kept.push_back(i);
+        }
+    }
+    if (kept.size() == 4) {
+        return { val, tensor_ty(d, elem), k_id4 };
+    }
+
+    std::ostringstream reassoc, map;
+    std::vector<int64_t> dims;
+    reassoc << "[";
+    map << "affine_map<(d0, d1, d2, d3) -> (";
+    for (size_t g = 0; g < kept.size(); g++) {
+        const int first = g == 0 ? 0 : kept[g - 1] + 1;
+        const int last  = g + 1 == kept.size() ? 3 : kept[g];
+        reassoc << (g ? ", " : "") << "[";
+        for (int i = first; i <= last; i++) {
+            reassoc << (i > first ? ", " : "") << i;
+        }
+        reassoc << "]";
+        map << (g ? ", " : "") << "d" << kept[g];
+        dims.push_back(d[kept[g]]);
+    }
+    reassoc << "]";
+    map << ")>";
+
+    const std::string ct = tensor_ty(dims, elem);
+    const std::string c  = b.fresh();
+    b.body << "  " << c << " = tensor.collapse_shape " << val << " " << reassoc.str() << " : " << tensor_ty(d, elem) << " into " << ct << "\n";
+    return { c, ct, map.str() };
+}
+
 // --- ADD / SUB / MUL / DIV ---
 // src1 is broadcast along every dim where it has size 1.
 
@@ -373,48 +451,12 @@ static std::string emit_binary(builder & b, const struct ggml_tensor * node, con
 
     const std::string ty = tensor_ty(node);
     const std::string x  = b.get(src0);
-    std::string       y  = b.get(src1);
-    std::string       yt = tensor_ty(src1);
-    std::string       ymap = k_id4;
-
-    // drop the broadcast dims of src1, so its indexing map stays a plain projection
-    const std::vector<int64_t> d0 = dims4(src0);
-    const std::vector<int64_t> d1 = dims4(src1);
-    std::vector<int> kept;
-    for (int i = 0; i < 4; i++) {
-        if (d1[i] == d0[i]) {
-            kept.push_back(i);
-        }
-    }
-    if (kept.size() < 4) {
-        std::ostringstream reassoc, map;
-        std::vector<int64_t> dims;
-        reassoc << "[";
-        map << "affine_map<(d0, d1, d2, d3) -> (";
-        for (size_t g = 0; g < kept.size(); g++) {
-            const int first = g == 0 ? 0 : kept[g - 1] + 1;
-            const int last  = g + 1 == kept.size() ? 3 : kept[g];
-            reassoc << (g ? ", " : "") << "[";
-            for (int i = first; i <= last; i++) {
-                reassoc << (i > first ? ", " : "") << i;
-            }
-            reassoc << "]";
-            map << (g ? ", " : "") << "d" << kept[g];
-            dims.push_back(d1[kept[g]]);
-        }
-        reassoc << "]";
-        map << ")>";
-
-        const std::string ct = tensor_ty(dims, "f32");
-        const std::string c  = b.fresh();
-        b.body << "  " << c << " = tensor.collapse_shape " << y << " " << reassoc.str() << " : " << yt << " into " << ct << "\n";
-        y = c; yt = ct; ymap = map.str();
-    }
+    const operand     y  = broadcast4(b, b.get(src1), dims4(src1), dims4(src0), "f32");
 
     const std::string e = b.empty(ty);
     const std::string v = b.fresh();
-    b.body << "  " << v << " = linalg.generic {indexing_maps = [" << k_id4 << ", " << ymap << ", " << k_id4 << "], iterator_types = " << k_par4 << "}\n";
-    b.body << "      ins(" << x << ", " << y << " : " << ty << ", " << yt << ") outs(" << e << " : " << ty << ") {\n";
+    b.body << "  " << v << " = linalg.generic {indexing_maps = [" << k_id4 << ", " << y.map << ", " << k_id4 << "], iterator_types = " << k_par4 << "}\n";
+    b.body << "      ins(" << x << ", " << y.val << " : " << ty << ", " << y.ty << ") outs(" << e << " : " << ty << ") {\n";
     b.body << "  ^bb0(%in0: f32, %in1: f32, %out: f32):\n";
     b.body << "    %y = arith." << op << " %in0, %in1 : f32\n";
     b.body << "    linalg.yield %y : f32\n  } -> " << ty << "\n";
@@ -505,34 +547,75 @@ static std::string emit_rms_norm(builder & b, const struct ggml_tensor * node) {
     return v;
 }
 
-// --- SOFT_MAX over ne[0]: y = exp(x*scale - max) / sum(exp(x*scale - max)) ---
+// --- SOFT_MAX over ne[0]: w = x*scale + mask, y = exp(w - max) / sum(exp(w - max)) ---
 
 static std::string emit_soft_max(builder & b, const struct ggml_tensor * node) {
     const struct ggml_tensor * src0 = node->src[0];
+    const struct ggml_tensor * mask = node->src[1];
     const std::string ty    = tensor_ty(node);
     const std::string maxt  = tensor_ty({ node->ne[3], node->ne[2], node->ne[1] }, "f32");
     const std::string sumt  = tensor_ty({ node->ne[3], node->ne[2], node->ne[1] }, "f64");
-    const std::string x     = b.get(src0);
-    const std::string scale = "    %scale = arith.constant " + f32_const(op_param_f32(node, 0)) + " : f32\n"
-                              "    %w = arith.mulf %in, %scale : f32\n";
+    const float       scale = op_param_f32(node, 0);
+
+    // scaled and masked input
+    std::string w = b.get(src0);
+    if (mask || scale != 1.0f) {
+        const std::string x = w;
+        operand m;
+        const char * mt = nullptr;
+        if (mask) {
+            mt = mlir_elem_type(mask->type);
+            std::string mv = b.get(mask);
+            std::vector<int64_t> md = dims4(mask);
+            if (md[2] > node->ne[1]) {
+                // the mask may have more rows than the input: use the first ones
+                const std::string full_t = tensor_ty(md, mt);
+                md[2] = node->ne[1];
+                const std::string cut = b.fresh();
+                b.body << "  " << cut << " = tensor.extract_slice " << mv << "[0, 0, 0, 0] [" << md[0] << ", " << md[1] << ", " << md[2] << ", " << md[3]
+                       << "] [1, 1, 1, 1] : " << full_t << " to " << tensor_ty(md, mt) << "\n";
+                mv = cut;
+            }
+            m = broadcast4(b, mv, md, dims4(node), mt);
+        }
+        const std::string e = b.empty(ty);
+        w = b.fresh();
+        b.body << "  " << w << " = linalg.generic {indexing_maps = [" << k_id4 << (mask ? ", " + m.map : "") << ", " << k_id4 << "], iterator_types = " << k_par4 << "}\n";
+        b.body << "      ins(" << x << (mask ? ", " + m.val : "") << " : " << ty << (mask ? ", " + m.ty : "") << ") outs(" << e << " : " << ty << ") {\n";
+        b.body << "  ^bb0(%in: f32, " << (mask ? std::string("%m: ") + mt + ", " : "") << "%out: f32):\n";
+        b.body << "    %scale = arith.constant " << f32_const(scale) << " : f32\n";
+        b.body << "    %sc = arith.mulf %in, %scale : f32\n";
+        if (!mask) {
+            b.body << "    linalg.yield %sc : f32\n";
+        } else {
+            if (mask->type == GGML_TYPE_F32) {
+                b.body << "    %y = arith.addf %sc, %m : f32\n";
+            } else {
+                b.body << "    %mw = arith.extf %m : " << mt << " to f32\n";
+                b.body << "    %y = arith.addf %sc, %mw : f32\n";
+            }
+            b.body << "    linalg.yield %y : f32\n";
+        }
+        b.body << "  } -> " << ty << "\n";
+    }
 
     // row maximum
     const std::string max_init = b.filled(maxt, "f32", "0xFF800000"); // -inf
     const std::string max      = b.fresh();
     b.body << "  " << max << " = linalg.generic {indexing_maps = [" << k_id4 << ", " << k_row4 << "], iterator_types = " << k_red4 << "}\n";
-    b.body << "      ins(" << x << " : " << ty << ") outs(" << max_init << " : " << maxt << ") {\n";
-    b.body << "  ^bb0(%in: f32, %acc: f32):\n" << scale;
-    b.body << "    %gt = arith.cmpf ogt, %w, %acc : f32\n";
-    b.body << "    %m = arith.select %gt, %w, %acc : f32\n";
+    b.body << "      ins(" << w << " : " << ty << ") outs(" << max_init << " : " << maxt << ") {\n";
+    b.body << "  ^bb0(%in: f32, %acc: f32):\n";
+    b.body << "    %gt = arith.cmpf ogt, %in, %acc : f32\n";
+    b.body << "    %m = arith.select %gt, %in, %acc : f32\n";
     b.body << "    linalg.yield %m : f32\n  } -> " << maxt << "\n";
 
-    // row sum of exp(x - max), accumulated in f64 like ggml does
+    // row sum of exp(w - max), accumulated in f64 like ggml does
     const std::string sum_init = b.filled(sumt, "f64", "0.0");
     const std::string sum      = b.fresh();
     b.body << "  " << sum << " = linalg.generic {indexing_maps = [" << k_id4 << ", " << k_row4 << ", " << k_row4 << "], iterator_types = " << k_red4 << "}\n";
-    b.body << "      ins(" << x << ", " << max << " : " << ty << ", " << maxt << ") outs(" << sum_init << " : " << sumt << ") {\n";
-    b.body << "  ^bb0(%in: f32, %max: f32, %acc: f64):\n" << scale;
-    b.body << "    %d = arith.subf %w, %max : f32\n";
+    b.body << "      ins(" << w << ", " << max << " : " << ty << ", " << maxt << ") outs(" << sum_init << " : " << sumt << ") {\n";
+    b.body << "  ^bb0(%in: f32, %max: f32, %acc: f64):\n";
+    b.body << "    %d = arith.subf %in, %max : f32\n";
     b.body << "    %e = math.exp %d : f32\n";
     b.body << "    %ed = arith.extf %e : f32 to f64\n";
     b.body << "    %s = arith.addf %acc, %ed : f64\n";
@@ -541,9 +624,9 @@ static std::string emit_soft_max(builder & b, const struct ggml_tensor * node) {
     const std::string e = b.empty(ty);
     const std::string v = b.fresh();
     b.body << "  " << v << " = linalg.generic {indexing_maps = [" << k_id4 << ", " << k_row4 << ", " << k_row4 << ", " << k_id4 << "], iterator_types = " << k_par4 << "}\n";
-    b.body << "      ins(" << x << ", " << max << ", " << sum << " : " << ty << ", " << maxt << ", " << sumt << ") outs(" << e << " : " << ty << ") {\n";
-    b.body << "  ^bb0(%in: f32, %max: f32, %sum: f64, %out: f32):\n" << scale;
-    b.body << "    %d = arith.subf %w, %max : f32\n";
+    b.body << "      ins(" << w << ", " << max << ", " << sum << " : " << ty << ", " << maxt << ", " << sumt << ") outs(" << e << " : " << ty << ") {\n";
+    b.body << "  ^bb0(%in: f32, %max: f32, %sum: f64, %out: f32):\n";
+    b.body << "    %d = arith.subf %in, %max : f32\n";
     b.body << "    %e = math.exp %d : f32\n";
     b.body << "    %oned = arith.constant 1.0 : f64\n";
     b.body << "    %invd = arith.divf %oned, %sum : f64\n";
@@ -553,10 +636,157 @@ static std::string emit_soft_max(builder & b, const struct ggml_tensor * node) {
     return v;
 }
 
+// --- ROPE: rotate pairs of channels by an angle that depends on the token position ---
+//
+// x ne=[D, H, T, B], pos ne=[T]. For pair j of the first n_dims channels:
+//   theta = freq_scale * pos[t] * freq_base^(-2j/n_dims)
+//   y0 = x0*cos(theta) - x1*sin(theta),  y1 = x0*sin(theta) + x1*cos(theta)
+// The pair is channels (2j, 2j+1) in the standard layout and (j, j + n_dims/2) in the NeoX layout.
+
+static std::string emit_rope(builder & b, const struct ggml_tensor * node) {
+    const struct ggml_tensor * src0 = node->src[0];
+    const struct ggml_tensor * pos  = node->src[1];
+
+    const int64_t D = node->ne[0], H = node->ne[1], T = node->ne[2], B = node->ne[3];
+    const int64_t n  = op_param_i32(node, 1);
+    const int64_t h2 = n / 2;
+    const bool    neox = op_param_i32(node, 2) == GGML_ROPE_TYPE_NEOX;
+
+    const std::string ty = tensor_ty(node);
+    const std::string x  = b.get(src0);
+    std::ostringstream & os = b.body;
+
+    // per-pair frequency, multiplied up step by step in f32 like ggml does
+    const std::string freq_t = tensor_ty({ h2 }, "f32");
+    const std::string freq   = b.fresh();
+    {
+        const float theta_scale = powf(op_param_f32(node, 5), -2.0f / (float) n);
+        float f = 1.0f;
+        os << "  " << freq << " = arith.constant dense<[";
+        for (int64_t j = 0; j < h2; j++) {
+            os << (j ? ", " : "") << f32_const(f);
+            f *= theta_scale;
+        }
+        os << "]> : " << freq_t << "\n";
+    }
+
+    // cos and sin tables: [T, n_dims/2]
+    const std::string pos_t = tensor_ty({ T }, "i32");
+    const std::string tab_t = tensor_ty({ T, h2 }, "f32");
+    const std::string posv  = b.get(pos);
+    const std::string pos1  = b.fresh();
+    os << "  " << pos1 << " = tensor.collapse_shape " << posv << " [[0, 1, 2, 3]] : " << tensor_ty(pos) << " into " << pos_t << "\n";
+    const std::string ce = b.empty(tab_t), se = b.empty(tab_t);
+    const std::string cs = b.fresh();
+    os << "  " << cs << ", " << cs << "s = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0)>, affine_map<(d0, d1) -> (d1)>, affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = [\"parallel\", \"parallel\"]}\n";
+    os << "      ins(" << pos1 << ", " << freq << " : " << pos_t << ", " << freq_t << ") outs(" << ce << ", " << se << " : " << tab_t << ", " << tab_t << ") {\n";
+    os << "  ^bb0(%p: i32, %f: f32, %o0: f32, %o1: f32):\n";
+    os << "    %pf = arith.sitofp %p : i32 to f32\n";
+    os << "    %ext = arith.mulf %pf, %f : f32\n";
+    os << "    %fs = arith.constant " << f32_const(op_param_f32(node, 6)) << " : f32\n";
+    os << "    %theta = arith.mulf %fs, %ext : f32\n";
+    os << "    %mscale = arith.constant " << f32_const(op_param_f32(node, 8)) << " : f32\n";
+    os << "    %c0 = math.cos %theta : f32\n";
+    os << "    %s0 = math.sin %theta : f32\n";
+    os << "    %c = arith.mulf %c0, %mscale : f32\n";
+    os << "    %s = arith.mulf %s0, %mscale : f32\n";
+    os << "    linalg.yield %c, %s : f32, f32\n  } -> (" << tab_t << ", " << tab_t << ")\n";
+    const std::string cosv = cs, sinv = cs + "s";
+
+    // the rotated channels, split into the two halves of each pair
+    const std::string rot_t  = tensor_ty({ B, T, H, n }, "f32");
+    const std::string half_t = tensor_ty({ B, T, H, h2 }, "f32");
+    const std::vector<int64_t> pair_dims = neox ? std::vector<int64_t>{ B, T, H, 2, h2 } : std::vector<int64_t>{ B, T, H, h2, 2 };
+    const std::string pair_t = tensor_ty(pair_dims, "f32");
+    const char * reassoc = "[[0], [1], [2], [3, 4]]";
+
+    std::ostringstream shape5, size5, off1;
+    shape5 << B << ", " << T << ", " << H << ", " << pair_dims[3] << ", " << pair_dims[4];
+    size5  << B << ", " << T << ", " << H << ", " << (neox ? 1 : h2) << ", " << (neox ? h2 : 1);
+    off1   << "0, 0, 0, " << (neox ? "1, 0" : "0, 1");
+
+    std::string rot = x;
+    if (n < D) {
+        rot = b.fresh();
+        os << "  " << rot << " = tensor.extract_slice " << x << "[0, 0, 0, 0] [" << B << ", " << T << ", " << H << ", " << n << "] [1, 1, 1, 1] : " << ty << " to " << rot_t << "\n";
+    }
+    const std::string pairs = b.fresh(), x0 = b.fresh(), x1 = b.fresh();
+    os << "  " << pairs << " = tensor.expand_shape " << rot << " " << reassoc << " output_shape [" << shape5.str() << "] : " << rot_t << " into " << pair_t << "\n";
+    os << "  " << x0 << " = tensor.extract_slice " << pairs << "[0, 0, 0, 0, 0] [" << size5.str() << "] [1, 1, 1, 1, 1] : " << pair_t << " to " << half_t << "\n";
+    os << "  " << x1 << " = tensor.extract_slice " << pairs << "[" << off1.str() << "] [" << size5.str() << "] [1, 1, 1, 1, 1] : " << pair_t << " to " << half_t << "\n";
+
+    // rotate
+    const char * tab_map = "affine_map<(d0, d1, d2, d3) -> (d1, d3)>";
+    const std::string e0 = b.empty(half_t), e1 = b.empty(half_t);
+    const std::string y = b.fresh();
+    os << "  " << y << ", " << y << "b = linalg.generic {indexing_maps = [" << k_id4 << ", " << k_id4 << ", " << tab_map << ", " << tab_map << ", " << k_id4 << ", " << k_id4 << "], iterator_types = " << k_par4 << "}\n";
+    os << "      ins(" << x0 << ", " << x1 << ", " << cosv << ", " << sinv << " : " << half_t << ", " << half_t << ", " << tab_t << ", " << tab_t << ") outs(" << e0 << ", " << e1 << " : " << half_t << ", " << half_t << ") {\n";
+    os << "  ^bb0(%x0: f32, %x1: f32, %c: f32, %s: f32, %o0: f32, %o1: f32):\n";
+    os << "    %x0c = arith.mulf %x0, %c : f32\n";
+    os << "    %x1s = arith.mulf %x1, %s : f32\n";
+    os << "    %y0 = arith.subf %x0c, %x1s : f32\n";
+    os << "    %x0s = arith.mulf %x0, %s : f32\n";
+    os << "    %x1c = arith.mulf %x1, %c : f32\n";
+    os << "    %y1 = arith.addf %x0s, %x1c : f32\n";
+    os << "    linalg.yield %y0, %y1 : f32, f32\n  } -> (" << half_t << ", " << half_t << ")\n";
+
+    // put the halves back together
+    const std::string e5 = b.empty(pair_t);
+    const std::string i0 = b.fresh(), i1 = b.fresh(), out = b.fresh();
+    os << "  " << i0 << " = tensor.insert_slice " << y << " into " << e5 << "[0, 0, 0, 0, 0] [" << size5.str() << "] [1, 1, 1, 1, 1] : " << half_t << " into " << pair_t << "\n";
+    os << "  " << i1 << " = tensor.insert_slice " << y << "b into " << i0 << "[" << off1.str() << "] [" << size5.str() << "] [1, 1, 1, 1, 1] : " << half_t << " into " << pair_t << "\n";
+    os << "  " << out << " = tensor.collapse_shape " << i1 << " " << reassoc << " : " << pair_t << " into " << rot_t << "\n";
+    if (n == D) {
+        return out;
+    }
+    // the remaining channels pass through
+    const std::string full = b.fresh();
+    os << "  " << full << " = tensor.insert_slice " << out << " into " << x << "[0, 0, 0, 0] [" << B << ", " << T << ", " << H << ", " << n << "] [1, 1, 1, 1] : " << rot_t << " into " << ty << "\n";
+    return full;
+}
+
+// --- GET_ROWS: y[i, :] = table[idx[i], :], converted to f32 ---
+
+static std::string emit_get_rows(builder & b, const struct ggml_tensor * node) {
+    const struct ggml_tensor * table = node->src[0];
+    const struct ggml_tensor * idx   = node->src[1];
+    const char * tt = mlir_elem_type(table->type);
+
+    const int64_t E = table->ne[0], V = table->ne[1], N = idx->ne[0];
+    const std::string table_t = tensor_ty({ V, E }, tt);
+    const std::string idx_t   = tensor_ty({ N }, "i32");
+    const std::string out_t   = tensor_ty({ N, E }, "f32");
+
+    const std::string tv = b.get(table), iv = b.get(idx);
+    const std::string t2 = b.fresh(), i1 = b.fresh();
+    b.body << "  " << t2 << " = tensor.collapse_shape " << tv << " [[0, 1, 2], [3]] : " << tensor_ty(table) << " into " << table_t << "\n";
+    b.body << "  " << i1 << " = tensor.collapse_shape " << iv << " [[0, 1, 2, 3]] : " << tensor_ty(idx) << " into " << idx_t << "\n";
+
+    const std::string e = b.empty(out_t);
+    const std::string g = b.fresh(), v = b.fresh();
+    b.body << "  " << g << " = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = [\"parallel\", \"parallel\"]}\n";
+    b.body << "      ins(" << i1 << " : " << idx_t << ") outs(" << e << " : " << out_t << ") {\n";
+    b.body << "  ^bb0(%i: i32, %out: f32):\n";
+    b.body << "    %row = arith.index_cast %i : i32 to index\n";
+    b.body << "    %col = linalg.index 1 : index\n";
+    b.body << "    %val = tensor.extract " << t2 << "[%row, %col] : " << table_t << "\n";
+    if (table->type == GGML_TYPE_F32) {
+        b.body << "    linalg.yield %val : f32\n";
+    } else {
+        b.body << "    %y = arith.extf %val : " << tt << " to f32\n";
+        b.body << "    linalg.yield %y : f32\n";
+    }
+    b.body << "  } -> " << out_t << "\n";
+    b.body << "  " << v << " = tensor.expand_shape " << g << " [[0, 1, 2], [3]] output_shape [1, 1, " << N << ", " << E << "] : " << out_t << " into " << tensor_ty(node) << "\n";
+    return v;
+}
+
 //
 // views: modelled as tensor ops when their source is a value of this function.
 // Otherwise the view is read through its own memref argument when something uses it.
 //
+
+static std::string emit_reshape(builder & b, const std::string & val, const struct ggml_tensor * from, const struct ggml_tensor * to);
 
 static void emit_view(builder & b, const struct ggml_tensor * node) {
     const struct ggml_tensor * src = node->src[0];
@@ -566,16 +796,9 @@ static void emit_view(builder & b, const struct ggml_tensor * node) {
     const std::string s  = b.vals[src];
     const std::string st = tensor_ty(src);
     const std::string nt = tensor_ty(node);
-    const char *      et = mlir_elem_type(node->type);
 
     if (node->op == GGML_OP_RESHAPE) {
-        const std::string flat_t = tensor_ty({ ggml_nelements(node) }, et);
-        const std::string flat   = b.fresh();
-        const std::string v      = b.fresh();
-        b.body << "  " << flat << " = tensor.collapse_shape " << s << " [[0, 1, 2, 3]] : " << st << " into " << flat_t << "\n";
-        b.body << "  " << v << " = tensor.expand_shape " << flat << " [[0, 1, 2, 3]] output_shape ["
-               << node->ne[3] << ", " << node->ne[2] << ", " << node->ne[1] << ", " << node->ne[0] << "] : " << flat_t << " into " << nt << "\n";
-        b.vals[node] = v;
+        b.vals[node] = emit_reshape(b, s, src, node);
         return;
     }
 
@@ -597,6 +820,25 @@ static void emit_view(builder & b, const struct ggml_tensor * node) {
     b.vals[node] = v;
 }
 
+// reinterpret a value with a new shape (same elements, same order)
+static std::string emit_reshape(builder & b, const std::string & val, const struct ggml_tensor * from, const struct ggml_tensor * to) {
+    const std::string flat_t = tensor_ty({ ggml_nelements(to) }, mlir_elem_type(to->type));
+    const std::string flat   = b.fresh();
+    const std::string v      = b.fresh();
+    b.body << "  " << flat << " = tensor.collapse_shape " << val << " [[0, 1, 2, 3]] : " << tensor_ty(from) << " into " << flat_t << "\n";
+    b.body << "  " << v << " = tensor.expand_shape " << flat << " [[0, 1, 2, 3]] output_shape ["
+           << to->ne[3] << ", " << to->ne[2] << ", " << to->ne[1] << ", " << to->ne[0] << "] : " << flat_t << " into " << tensor_ty(to) << "\n";
+    return v;
+}
+
+// --- CONT: a contiguous copy, possibly with a new shape (ggml_cont_2d etc.) ---
+
+static std::string emit_cont(builder & b, const struct ggml_tensor * node) {
+    const struct ggml_tensor * src = node->src[0];
+    const std::string v = b.get(src);
+    return same_shape(node, src) ? v : emit_reshape(b, v, src, node);
+}
+
 static std::string emit_op(builder & b, const struct ggml_tensor * node) {
     switch (node->op) {
         case GGML_OP_MUL_MAT:  return emit_mul_mat(b, node);
@@ -609,7 +851,9 @@ static std::string emit_op(builder & b, const struct ggml_tensor * node) {
         case GGML_OP_GLU:      return emit_swiglu(b, node);
         case GGML_OP_RMS_NORM: return emit_rms_norm(b, node);
         case GGML_OP_SOFT_MAX: return emit_soft_max(b, node);
-        case GGML_OP_CONT:     return b.get(node->src[0]);
+        case GGML_OP_ROPE:     return emit_rope(b, node);
+        case GGML_OP_GET_ROWS: return emit_get_rows(b, node);
+        case GGML_OP_CONT:     return emit_cont(b, node);
         default:               return "";
     }
 }

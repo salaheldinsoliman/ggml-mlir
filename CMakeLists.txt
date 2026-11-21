@@ -10,14 +10,24 @@ set(LLAMA_CPP_BUILD_DIR "${LLAMA_CPP_DIR}/build"                            CACH
 
 find_library(GGML_BASE_LIB ggml-base PATHS "${LLAMA_CPP_BUILD_DIR}/bin" NO_DEFAULT_PATH REQUIRED)
 
+# upstream MLIR (Homebrew LLVM on macOS: pass -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/llvm or rely on the hint)
+find_package(MLIR REQUIRED CONFIG HINTS /opt/homebrew/opt/llvm/lib/cmake/mlir)
+message(STATUS "Using MLIR from ${MLIR_DIR}")
+
 # the plugin: loaded at runtime via GGML_BACKEND_PATH or ggml_backend_load()
-add_library(ggml-mlir MODULE src/ggml-mlir.cpp)
+add_library(ggml-mlir MODULE
+    src/ggml-mlir.cpp       # ggml backend interface
+    src/mlir-emit.cpp       # ggml node -> MLIR text
+    src/mlir-jit.cpp)       # MLIR -> native code, cache
 
 target_include_directories(ggml-mlir PRIVATE
     ${LLAMA_CPP_DIR}/ggml/include
     ${LLAMA_CPP_DIR}/ggml/src)          # ggml-backend-impl.h, ggml-impl.h (internal, pinned to our llama.cpp commit)
+target_include_directories(ggml-mlir SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
 
 # same definitions ggml_add_backend_library() gives in-tree dynamic backends
 target_compile_definitions(ggml-mlir PRIVATE GGML_BACKEND_DL GGML_BACKEND_BUILD GGML_BACKEND_SHARED GGML_SHARED)
+separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND "${LLVM_DEFINITIONS}")
+target_compile_options(ggml-mlir PRIVATE ${LLVM_DEFINITIONS_LIST})
 
-target_link_libraries(ggml-mlir PRIVATE ${GGML_BASE_LIB})
+target_link_libraries(ggml-mlir PRIVATE ${GGML_BASE_LIB} MLIRExecutionEngineShared MLIR LLVM)

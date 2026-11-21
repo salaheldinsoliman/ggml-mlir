@@ -5,11 +5,14 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-mlir-impl.h"
 
 #include <cstring>
 
 struct ggml_backend_mlir_context {
-    int dummy = 0; // placeholder: will hold the compile cache
+    ggml_mlir_jit * jit = ggml_mlir_jit_new(); // compiled kernels, cached by node key
+
+    ~ggml_backend_mlir_context() { ggml_mlir_jit_free(jit); }
 };
 
 // backend interface
@@ -26,6 +29,8 @@ static void ggml_backend_mlir_free(ggml_backend_t backend) {
 }
 
 static enum ggml_status ggml_backend_mlir_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    ggml_backend_mlir_context * ctx = (ggml_backend_mlir_context *) backend->context;
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
 
@@ -41,14 +46,16 @@ static enum ggml_status ggml_backend_mlir_graph_compute(ggml_backend_t backend, 
             case GGML_OP_TRANSPOSE:
                 break;
 
+            case GGML_OP_MUL_MAT:
+                ggml_mlir_jit_compute(ctx->jit, node);
+                break;
+
             default:
                 GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
         }
     }
 
     return GGML_STATUS_SUCCESS;
-
-    GGML_UNUSED(backend);
 }
 
 static struct ggml_backend_i mlir_backend_i = {
@@ -156,6 +163,9 @@ static bool ggml_backend_mlir_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
             return true;
+
+        case GGML_OP_MUL_MAT:
+            return ggml_mlir_can_emit(op);
 
         default:
             return false;

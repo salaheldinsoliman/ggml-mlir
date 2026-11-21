@@ -20,6 +20,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -64,6 +65,7 @@ struct ggml_mlir_jit {
     bool         dump         = false; // GGML_MLIR_DUMP=1: print emitted MLIR
     bool         dump_lowered = false; // GGML_MLIR_DUMP=2: also print the lowered (LLVM dialect) module
     bool         stats        = false; // GGML_MLIR_STATS=1: print function and call counts on exit
+    const char * export_dir   = nullptr; // GGML_MLIR_EXPORT=<dir>: write each emitted function to <dir>/kernel_<n>.mlir
     size_t       n_calls      = 0;
     size_t       n_ops        = 0;     // ops in all compiled functions
 
@@ -73,6 +75,7 @@ struct ggml_mlir_jit {
         dump         = env != nullptr;
         dump_lowered = env != nullptr && std::atoi(env) >= 2;
         stats        = std::getenv("GGML_MLIR_STATS") != nullptr;
+        export_dir   = std::getenv("GGML_MLIR_EXPORT");
     }
 
     static mlir::DialectRegistry make_registry() {
@@ -108,6 +111,10 @@ void ggml_mlir_jit_free(ggml_mlir_jit * jit) {
 static kernel_entry compile(ggml_mlir_jit * jit, const ggml_mlir_func & func) {
     if (jit->dump) {
         fprintf(stderr, "// ggml-mlir: function %zu, %d ops\n%s\n", jit->cache.size(), func.n_ops, func.text.c_str());
+    }
+    if (jit->export_dir) {
+        std::ofstream out(std::string(jit->export_dir) + "/kernel_" + std::to_string(jit->cache.size()) + ".mlir");
+        out << func.text;
     }
 
     mlir::OwningOpRef<mlir::ModuleOp> module = mlir::parseSourceString<mlir::ModuleOp>(func.text, &jit->ctx);

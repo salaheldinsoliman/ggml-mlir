@@ -25,15 +25,37 @@ static std::string tensor_ty(std::initializer_list<int64_t> dims, const char * e
     return "tensor<" + shape_str(dims, elem) + ">";
 }
 
-static std::string memref_ty(std::initializer_list<int64_t> dims, const char * elem) {
-    return "memref<" + shape_str(dims, elem) + ">";
-}
-
 static const char * mlir_elem_type(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_F32: return "f32";
-        default:            return nullptr;
+        case GGML_TYPE_F32:  return "f32";
+        case GGML_TYPE_F16:  return "f16";
+        case GGML_TYPE_BF16: return "bf16";
+        default:             return nullptr;
     }
+}
+
+// strides must be whole elements to be expressible as a memref layout
+static bool has_element_strides(const struct ggml_tensor * t) {
+    const size_t es = ggml_type_size(t->type);
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (t->nb[i] % es != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// rank-4 memref type of a ggml tensor: dims reversed. Views and permutes get an explicit strided layout.
+static std::string memref_ty(const struct ggml_tensor * t) {
+    const char * elem = mlir_elem_type(t->type);
+    std::ostringstream os;
+    os << "memref<" << shape_str({t->ne[3], t->ne[2], t->ne[1], t->ne[0]}, elem);
+    if (!ggml_is_contiguous(t)) {
+        const int64_t es = (int64_t) ggml_type_size(t->type);
+        os << ", strided<[" << t->nb[3] / es << ", " << t->nb[2] / es << ", " << t->nb[1] / es << ", " << t->nb[0] / es << "], offset: 0>";
+    }
+    os << ">";
+    return os.str();
 }
 
 // --- MUL_MAT ---
@@ -52,7 +74,7 @@ static bool mul_mat_supported(const struct ggml_tensor * node) {
     if (!mlir_elem_type(src0->type) || src1->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
         return false;
     }
-    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(node)) {
+    if (!has_element_strides(src0) || !has_element_strides(src1) || !ggml_is_contiguous(node)) {
         return false;
     }
     for (int i = 0; i < GGML_MAX_DIMS; i++) {
@@ -84,9 +106,9 @@ static std::string emit_mul_mat(const struct ggml_tensor * node) {
     const std::string w4 = tensor_ty({B3a, B2a, N, K}, t0);
     const std::string x4 = tensor_ty({B3,  B2,  M, K}, t1);
     const std::string y4 = tensor_ty({B3,  B2,  M, N}, td);
-    const std::string w4m = memref_ty({B3a, B2a, N, K}, t0);
-    const std::string x4m = memref_ty({B3,  B2,  M, K}, t1);
-    const std::string y4m = memref_ty({B3,  B2,  M, N}, td);
+    const std::string w4m = memref_ty(src0);
+    const std::string x4m = memref_ty(src1);
+    const std::string y4m = memref_ty(node);
 
     std::ostringstream os;
     os << "func.func @kernel(%src0: " << w4m << ", %src1: " << x4m << ", %dst: " << y4m << ") attributes {llvm.emit_c_interface} {\n";
@@ -98,7 +120,13 @@ static std::string emit_mul_mat(const struct ggml_tensor * node) {
     // multiply-accumulate body, shared by both forms
     std::ostringstream body;
     body << "  ^bb0(%a: " << t1 << ", %b: " << t0 << ", %acc: " << td << "):\n";
-    body << "    %p = arith.mulf %a, %b : " << td << "\n";
+    if (src0->type == GGML_TYPE_F32) {
+        body << "    %p = arith.mulf %a, %b : " << td << "\n";
+    } else {
+        // half-precision weights: widen to f32, accumulate in f32
+        body << "    %bw = arith.extf %b : " << t0 << " to " << td << "\n";
+        body << "    %p = arith.mulf %a, %bw : " << td << "\n";
+    }
     body << "    %s = arith.addf %acc, %p : " << td << "\n";
     body << "    linalg.yield %s : " << td << "\n";
 
@@ -162,6 +190,9 @@ std::string ggml_mlir_node_key(const struct ggml_tensor * node) {
     for (int s = 0; s < GGML_MAX_SRC && node->src[s]; s++) {
         const struct ggml_tensor * src = node->src[s];
         os << "|" << ggml_type_name(src->type) << "[" << src->ne[0] << "," << src->ne[1] << "," << src->ne[2] << "," << src->ne[3] << "]";
+        if (!ggml_is_contiguous(src)) {
+            os << "s[" << src->nb[0] << "," << src->nb[1] << "," << src->nb[2] << "," << src->nb[3] << "]";
+        }
     }
     return os.str();
 }

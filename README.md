@@ -27,8 +27,7 @@ llama.cpp graph
 | | |
 |---|---|
 | Plugin loads into unmodified llama.cpp | yes |
-| `MUL_MAT`, f32, contiguous inputs, batched and broadcast | 149/149 `test-backend-ops` cases pass |
-| f16 / bf16 weights, views and permuted inputs | not yet |
+| `MUL_MAT` with f32, f16 or bf16 weights, batched and broadcast, including views and permuted inputs | 812/812 `test-backend-ops` cases pass |
 | Quantised weights (Q8_0, Q4_0, Q4_K) | not yet |
 | Other operations (norm, softmax, RoPE, ...) | not yet |
 | AMD NPU compile path | not yet |
@@ -77,7 +76,7 @@ Set `GGML_MLIR_DUMP=1` to print the MLIR generated for each operation.
 
 ## Roadmap
 
-1. f16 / bf16 weights and non-contiguous inputs.
+1. ~~f16 / bf16 weights and non-contiguous inputs.~~ Done.
 2. A small model with all its matrix multiplications running through the plugin, checked against the CPU.
 3. The same MLIR compiled to an AMD NPU binary.
 4. Run and measure on NPU hardware.

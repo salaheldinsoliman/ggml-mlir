@@ -61,12 +61,15 @@ struct ggml_mlir_jit {
     std::unordered_map<std::string, kernel_entry> cache;
     bool dump         = false; // GGML_MLIR_DUMP=1: print emitted MLIR
     bool dump_lowered = false; // GGML_MLIR_DUMP=2: also print the lowered (LLVM dialect) module
+    bool stats        = false; // GGML_MLIR_STATS=1: print kernel and call counts on exit
+    size_t n_calls    = 0;
 
     ggml_mlir_jit() : ctx(make_registry(), mlir::MLIRContext::Threading::DISABLED) {
         ctx.loadAllAvailableDialects();
         const char * env = std::getenv("GGML_MLIR_DUMP");
         dump         = env != nullptr;
         dump_lowered = env != nullptr && std::atoi(env) >= 2;
+        stats        = std::getenv("GGML_MLIR_STATS") != nullptr;
     }
 
     static mlir::DialectRegistry make_registry() {
@@ -93,6 +96,9 @@ ggml_mlir_jit * ggml_mlir_jit_new(void) {
 }
 
 void ggml_mlir_jit_free(ggml_mlir_jit * jit) {
+    if (jit->stats) {
+        fprintf(stderr, "ggml-mlir: %zu kernels compiled, %zu kernel calls\n", jit->cache.size(), jit->n_calls);
+    }
     delete jit;
 }
 
@@ -160,6 +166,8 @@ void ggml_mlir_jit_compute(ggml_mlir_jit * jit, struct ggml_tensor * node) {
     if (it == jit->cache.end()) {
         it = jit->cache.emplace(key, compile(jit, node)).first;
     }
+
+    jit->n_calls++;
 
     memref4 a = make_memref4(node->src[0]);
     memref4 b = make_memref4(node->src[1]);

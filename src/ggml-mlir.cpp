@@ -1,6 +1,6 @@
 // ggml-mlir: a ggml backend that compiles ggml ops through MLIR.
 // Structure follows ggml/src/ggml-blas/ggml-blas.cpp: tensors live in host (CPU) buffers,
-// the backend only claims the ops it can compile.
+// the backend only claims the ops it can translate.
 
 #include "ggml.h"
 #include "ggml-impl.h"
@@ -10,7 +10,7 @@
 #include <cstring>
 
 struct ggml_backend_mlir_context {
-    ggml_mlir_jit * jit = ggml_mlir_jit_new(); // compiled kernels, cached by node key
+    ggml_mlir_jit * jit = ggml_mlir_jit_new(); // compiled functions and their cache
 
     ~ggml_backend_mlir_context() { ggml_mlir_jit_free(jit); }
 };
@@ -31,29 +31,8 @@ static void ggml_backend_mlir_free(ggml_backend_t backend) {
 static enum ggml_status ggml_backend_mlir_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_mlir_context * ctx = (ggml_backend_mlir_context *) backend->context;
 
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        struct ggml_tensor * node = cgraph->nodes[i];
-
-        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-            continue;
-        }
-
-        switch (node->op) {
-            case GGML_OP_NONE:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_VIEW:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_TRANSPOSE:
-                break;
-
-            case GGML_OP_MUL_MAT:
-                ggml_mlir_jit_compute(ctx->jit, node);
-                break;
-
-            default:
-                GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
-        }
-    }
+    // the whole run of nodes becomes one compiled function
+    ggml_mlir_jit_compute(ctx->jit, cgraph->nodes, cgraph->n_nodes);
 
     return GGML_STATUS_SUCCESS;
 }
@@ -164,11 +143,8 @@ static bool ggml_backend_mlir_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_TRANSPOSE:
             return true;
 
-        case GGML_OP_MUL_MAT:
-            return ggml_mlir_can_emit(op);
-
         default:
-            return false;
+            return ggml_mlir_can_emit(op);
     }
 
     GGML_UNUSED(dev);

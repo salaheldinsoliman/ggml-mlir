@@ -31,3 +31,7 @@ separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND "${LLVM_DEFINITIONS}")
 target_compile_options(ggml-mlir PRIVATE ${LLVM_DEFINITIONS_LIST})
 
 target_link_libraries(ggml-mlir PRIVATE ${GGML_BASE_LIB} MLIRExecutionEngineShared MLIR LLVM)
+
+# MLIR's runtime helpers (strided memref copies), loaded by the JIT at run time
+find_library(MLIR_C_RUNNER_UTILS mlir_c_runner_utils HINTS ${LLVM_LIBRARY_DIRS} ${LLVM_LIBRARY_DIR} REQUIRED)
+target_compile_definitions(ggml-mlir PRIVATE GGML_MLIR_RUNNER_UTILS="${MLIR_C_RUNNER_UTILS}")
